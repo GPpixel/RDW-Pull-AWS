@@ -97,7 +97,6 @@ aws ssm get-parameter --name /rdw/current-source-file --query Parameter.Value --
 
 ## Notes
 
-- **Imports cost money each run.** DynamoDB charges for imports by the uncompressed size of the source data, about $0.15 per GB in us-east-1. At around 13 GB, that's roughly $2 per import, plus storage for the 2 tables kept. Days when RDW's data hasn't changed are skipped. If you don't need daily data, a weekly `ScheduleExpression` cuts the cost.
 - **One row per plate is assumed.** The completeness check compares the items imported with the rows downloaded. If some plates appear more than once, DynamoDB merges them, and if that's more than 0.1% of rows every run is rejected with "Too few items imported".
 - **Same format as the Export button.** The SODA3 export gives the portal's Export button format. A full laptop download was compared with a button export: they came out the same size, and a spot-checked record was identical, character for character. Numbers can carry thousands separators (`1,573`, and a year as `2,025`), and the DT date columns read like `2027 May 16 12:00:00 AM`. Anything that already handles the button's file handles this data the same way.
 - **Columns come in as text.** Every column other than the key is imported as a string, exactly as written in the file, so convert dates and numbers in your app if you need them typed.
