@@ -1,6 +1,6 @@
 # RDW-Pull-AWS
 
-Daily pipeline that downloads the RDW open data CSV **Gekentekende_voertuigen** (dataset `m9d7-ebf2`, about 17 million rows) and loads it into DynamoDB. It runs entirely in AWS and is defined in one CloudFormation template, `rdw-pipeline.yaml`.
+Daily pipeline that downloads the RDW open data CSV **Gekentekende_voertuigen** (dataset `m9d7-ebf2`, about 16.9 million rows, about 13 GB) and loads it into DynamoDB. It runs entirely in AWS and is defined in one CloudFormation template, `rdw-pipeline.yaml`.
 
 ## How it works
 
@@ -27,7 +27,7 @@ If RDW's dataset metadata (update time and name) can't be read, the run carries 
 
 ## Deploy
 
-You need the AWS CLI, signed in, with your default region set to where the data should live. RDW's portal is hosted in AWS `eu-west-1` (Ireland), so deploying there gives the fastest download.
+You need the AWS CLI, signed in as a user who can create IAM roles and the stack's other resources (S3, ECS, EventBridge, SNS, CloudWatch), with your default region set to where the data should live. RDW's portal is hosted in AWS `eu-west-1` (Ireland), so deploying there gives the fastest download.
 
 Find your default VPC and its subnets:
 
@@ -84,7 +84,7 @@ Run the command it prints, then follow the logs:
 aws logs tail /ecs/rdw-pipeline --follow
 ```
 
-A full run takes the download time (30+ minutes) plus the import time. To force a run when RDW's data hasn't changed, delete the `/rdw/last-updated` parameter first.
+A full run takes the download (about 40 minutes over a home connection, likely less from inside AWS) plus the import. To force a run when RDW's data hasn't changed, delete the `/rdw/last-updated` parameter first.
 
 ## Reading the data
 
@@ -98,8 +98,9 @@ aws ssm get-parameter --name /rdw/current-source-file --query Parameter.Value --
 
 ## Notes
 
-- **Imports cost money each run.** DynamoDB charges for imports by the uncompressed size of the source data, about $0.15 per GB in us-east-1. At around 12 GB, that's roughly $1.80 per import, plus storage for the 2 tables kept. Days when RDW's data hasn't changed are skipped. If you don't need daily data, a weekly `ScheduleExpression` cuts the cost.
+- **Imports cost money each run.** DynamoDB charges for imports by the uncompressed size of the source data, about $0.15 per GB in us-east-1. At around 13 GB, that's roughly $2 per import, plus storage for the 2 tables kept. Days when RDW's data hasn't changed are skipped. If you don't need daily data, a weekly `ScheduleExpression` cuts the cost.
 - **One row per plate is assumed.** The completeness check compares the items imported with the rows downloaded. If some plates appear more than once, DynamoDB merges them, and if that's more than 0.1% of rows every run is rejected with "Too few items imported".
-- **Columns come in as text.** Every column other than the key is imported as a string, so convert dates and numbers in your app if you need them typed.
+- **Same format as the Export button.** The SODA3 export gives the portal's Export button format. A full laptop download was compared with a button export: they came out the same size, and a spot-checked record was identical, character for character. Numbers can carry thousands separators (`1,573`, and a year as `2,025`), and the DT date columns read like `2027 May 16 12:00:00 AM`. Anything that already handles the button's file handles this data the same way. The old `rows.csv` route gave unquoted, unformatted values instead.
+- **Columns come in as text.** Every column other than the key is imported as a string, exactly as written in the file, so convert dates and numbers in your app if you need them typed.
 - **Removing the stack doesn't remove the data.** The tables are created by the task, not by the stack, so delete the `rdw-vehicles-*` tables yourself. Empty the S3 bucket first, or the stack deletion fails.
-- **Not yet run against a live account.** The template's structure and references have been checked, and the embedded script was dry-run against fake RDW and AWS commands (first run, no change, new data, table clean-up, cut-off download, failed import, too few items, wrong key column, RDW's metadata being unavailable, healthy-run heartbeats, and deprecation emails being sent once, repeated only when the notice changes, and sent even when the run fails). The first real deploy and run are still the real test. A full laptop download from the SODA3 export route was compared with the portal's Export button file and gives the same format: every value quoted, the same number and date formatting, and the same size to within the curl readout. The old `rows.csv` route gives unquoted, unformatted values instead.
+- **Not yet run against a live account.** The template's structure and references have been checked, and the embedded script was dry-run against fake RDW and AWS commands (first run, no change, new data, table clean-up, cut-off download, failed import, too few items, wrong key column, RDW's metadata being unavailable, healthy-run heartbeats, and deprecation emails being sent once, repeated only when the notice changes, and sent even when the run fails). The first real deploy and run are still the real test.
