@@ -3,8 +3,7 @@ Description: >-
   Weekly RDW open data download into DynamoDB. A scheduled Fargate task downloads the CSV,
   checks it's complete, uploads it to S3, imports it into a new DynamoDB table, then points
   the SSM parameter <ParamPrefix>/current-table at that table and deletes older tables.
-  Emails AlertEmail if a run fails, if no healthy run happens for AlertAfterDays, or if RDW's
-  API announces a deprecation.
+  Emails AlertEmail if a run fails or can't start, or if RDW's API announces a deprecation.
 
 Parameters:
   VpcId:
@@ -43,12 +42,7 @@ Parameters:
   AlertEmail:
     Type: String
     Default: ''
-    Description: Email address for alerts (failed runs, no healthy run for AlertAfterDays, RDW deprecation notices). AWS sends a confirmation email first - click the link in it.
-  AlertAfterDays:
-    Type: Number
-    Default: 8
-    MinValue: 1
-    Description: Email if no healthy run has happened for this many days (checked daily). Keep it above the schedule's interval - 8 suits a weekly schedule.
+    Description: Email address for alerts (failed runs, runs that can't start, RDW deprecation notices). AWS sends a confirmation email first - click the link in it.
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
@@ -229,12 +223,6 @@ Resources:
               WORK="${WORK:-/tmp/rdw}"
               mkdir -p "$WORK"
 
-              # Record a healthy run: a daily check emails you if none happens for AlertAfterDays
-              heartbeat() {
-                aws ssm put-parameter --name "$PARAM_PREFIX/last-healthy-run" --value "$(date -u +%s)" \
-                  --type String --overwrite >/dev/null 2>&1 || log "Couldn't record the healthy run."
-              }
-
               # Deprecation watch: collect any Deprecation/Sunset headers RDW sends, and email them
               # once (again only if the notice changes), however the run ends.
               DEPRECATIONS=""
@@ -284,7 +272,7 @@ Resources:
               if [[ "$updated" =~ ^[0-9]+$ ]]; then
                 last=$(aws ssm get-parameter --name "$PARAM_PREFIX/last-updated" --query Parameter.Value --output text 2>/dev/null || echo none)
                 if [[ "$last" == "$updated" && "${FORCE:-0}" != "1" ]]; then
-                  log "RDW data unchanged since the last import. Nothing to do."; heartbeat; exit 0
+                  log "RDW data unchanged since the last import. Nothing to do."; exit 0
                 fi
               else
                 updated=""
@@ -402,7 +390,6 @@ Resources:
                 log "Deleting old table $t"
                 aws dynamodb delete-table --table-name "$t" >/dev/null
               done
-              heartbeat
               log "Done."
 
   SchedulerRole:
@@ -425,9 +412,6 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt StaleCheckFunction.Arn
 
   Schedule:
     Type: AWS::Scheduler::Schedule
@@ -499,93 +483,6 @@ Resources:
             InputTemplate: >-
               "The RDW pipeline run couldn't start: <reason>. Nothing was changed, so apps keep
               using the previous table. Task: <task>"
-
-  StaleCheckRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: stale-check
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [ssm:GetParameter, ssm:PutParameter]
-                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParamPrefix}/last-healthy-run
-              - Effect: Allow
-                Action: sns:Publish
-                Resource: !Ref AlertTopic
-
-  # Runs daily: emails if no healthy run has been recorded for AlertAfterDays.
-  # The first check after deploying starts the clock, so a pipeline that never runs is caught too.
-  StaleCheckFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Description: Emails if the RDW pipeline hasn't had a healthy run for AlertAfterDays
-      Runtime: python3.12
-      Handler: index.handler
-      Timeout: 30
-      Role: !GetAtt StaleCheckRole.Arn
-      Environment:
-        Variables:
-          PARAM_NAME: !Sub ${ParamPrefix}/last-healthy-run
-          TOPIC_ARN: !Ref AlertTopic
-          ALERT_AFTER_DAYS: !Ref AlertAfterDays
-          LOG_GROUP: !Ref LogGroup
-      Code:
-        ZipFile: |
-          import os
-          import time
-
-          import boto3
-
-          ssm = boto3.client("ssm")
-          sns = boto3.client("sns")
-
-
-          def handler(event, context):
-              name = os.environ["PARAM_NAME"]
-              limit = float(os.environ["ALERT_AFTER_DAYS"])
-              now = int(time.time())
-              try:
-                  last = int(ssm.get_parameter(Name=name)["Parameter"]["Value"])
-              except ssm.exceptions.ParameterNotFound:
-                  # First check after deploying: start the clock now
-                  ssm.put_parameter(Name=name, Value=str(now), Type="String", Overwrite=True)
-                  return {"status": "clock started"}
-              days = (now - last) / 86400
-              if days <= limit:
-                  return {"status": "ok", "days_since_healthy_run": round(days, 1)}
-              sns.publish(
-                  TopicArn=os.environ["TOPIC_ARN"],
-                  Subject="RDW pipeline hasn't run",
-                  Message=(
-                      f"There has been no healthy RDW pipeline run for {days:.1f} days (the alert threshold "
-                      f"is {limit:g} days), so the data in DynamoDB may be going stale. The task may not be "
-                      f"starting at all: check the schedule and the log group {os.environ['LOG_GROUP']}. "
-                      "You'll get this email once a day until a run succeeds."
-                  ),
-              )
-              return {"status": "alerted", "days_since_healthy_run": round(days, 1)}
-
-  StaleCheckSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Description: Daily check that the RDW pipeline is still running
-      ScheduleExpression: cron(15 12 * * ? *)
-      ScheduleExpressionTimezone: Europe/London
-      FlexibleTimeWindow:
-        Mode: 'OFF'
-      Target:
-        Arn: !GetAtt StaleCheckFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
 
 Outputs:
   AlertTopicArn:
