@@ -3,6 +3,8 @@ Description: >-
   Daily RDW open data download into DynamoDB. A scheduled Fargate task downloads the CSV,
   checks it's complete, uploads it to S3, imports it into a new DynamoDB table, then points
   the SSM parameter <ParamPrefix>/current-table at that table and deletes older tables.
+  Emails AlertEmail if a run fails, if no healthy run happens for 2 days, or if RDW's API
+  announces a deprecation.
 
 Parameters:
   VpcId:
@@ -38,8 +40,41 @@ Parameters:
     Default: /rdw
     AllowedPattern: '/[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]'
     Description: SSM parameter path. <prefix>/current-table holds the live table name, <prefix>/current-source-file the RDW file it came from.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alerts (failed runs, no healthy run for 2 days, RDW deprecation notices). AWS sends a confirmation email first - click the link in it.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: RDW pipeline
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeAndCloudWatch
+            Effect: Allow
+            Principal: { Service: [events.amazonaws.com, cloudwatch.amazonaws.com] }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
   DataBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -138,6 +173,17 @@ Resources:
                 Effect: Allow
                 Action: logs:DescribeLogGroups
                 Resource: '*'
+              - Sid: DeprecationEmail
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: HealthyRunMetric
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: RDWPipeline
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -167,6 +213,9 @@ Resources:
             - { Name: KEEP_TABLES, Value: !Ref KeepTables }
             - { Name: PARAM_PREFIX, Value: !Ref ParamPrefix }
             - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+            - { Name: TOPIC_ARN, Value: !Ref AlertTopic }
+            - { Name: METRIC_NAMESPACE, Value: RDWPipeline }
+            - { Name: STACK_NAME, Value: !Ref AWS::StackName }
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -182,6 +231,46 @@ Resources:
               KEEP_TABLES="${KEEP_TABLES:-2}"
               BASE="${RDW_BASE:-https://opendata.rdw.nl}"
               WORK="${WORK:-/tmp/rdw}"
+              mkdir -p "$WORK"
+
+              # Healthy-run heartbeat: a CloudWatch alarm emails you if none arrives for 2 days
+              heartbeat() {
+                if [[ -n "${METRIC_NAMESPACE:-}" ]]; then
+                  aws cloudwatch put-metric-data --namespace "$METRIC_NAMESPACE" --metric-name HealthyRun \
+                    --dimensions "Stack=${STACK_NAME:-rdw-pipeline}" --value 1 >/dev/null 2>&1 \
+                    || log "Couldn't record the healthy-run metric."
+                fi
+              }
+
+              # Deprecation watch: collect any Deprecation/Sunset headers RDW sends, and email them
+              # once (again only if the notice changes), however the run ends.
+              DEPRECATIONS=""
+              check_deprecation() {  # $1 = response headers file, $2 = which request it was
+                local found
+                if [[ "$DEPRECATIONS" == *"$2"* ]]; then return 0; fi
+                found=$(grep -iE '^(deprecation|sunset):|^link:.*rel="?(deprecation|sunset)' "$1" 2>/dev/null \
+                  | tr -d '\r' | sort -u || true)
+                if grep -qiE '^(deprecation|sunset):' <<<"$found"; then
+                  DEPRECATIONS+="$2"$'\n'"$found"$'\n\n'
+                fi
+              }
+              notify_deprecations() {
+                local sig prev msg
+                if [[ -z "$DEPRECATIONS" ]]; then return 0; fi
+                log "WARNING: RDW says part of its API is deprecated:"
+                printf '%s' "$DEPRECATIONS" | sed 's/^/    /'
+                sig=$(printf '%s' "$DEPRECATIONS" | md5sum | cut -d' ' -f1)
+                prev=$(aws ssm get-parameter --name "$PARAM_PREFIX/deprecation-notice" --query Parameter.Value --output text 2>/dev/null || echo none)
+                if [[ "$sig" == "$prev" || -z "${TOPIC_ARN:-}" ]]; then return 0; fi
+                msg=$(printf 'The RDW API sent deprecation notices during the pipeline run on %s.\n\nThe pipeline may stop working after the sunset date, so it needs updating before then. You will only get this email again if the notice changes.\n\n%s' \
+                  "$(date -u '+%Y-%m-%d %H:%M UTC')" "$DEPRECATIONS")
+                if aws sns publish --topic-arn "$TOPIC_ARN" --subject "RDW API deprecation notice" --message "$msg" >/dev/null; then
+                  aws ssm put-parameter --name "$PARAM_PREFIX/deprecation-notice" --value "$sig" --type String --overwrite >/dev/null || true
+                else
+                  log "Couldn't send the deprecation email."
+                fi
+              }
+              trap notify_deprecations EXIT
 
               # The AWS CLI image is minimal: install curl/gzip if it lacks them
               missing=""
@@ -194,14 +283,15 @@ Resources:
               # 1. Has RDW published new data since the last import?
               #    The dataset's metadata gives its update time and name. If RDW ever stops serving it,
               #    the pipeline carries on regardless; it just can't skip days when nothing changed.
-              meta=$(curl -fsS --retry 3 "$BASE/api/views/$DATASET.json" || true)
+              meta=$(curl -fsS --retry 3 -D "$WORK/h_meta.txt" "$BASE/api/views/$DATASET.json" || true)
+              check_deprecation "$WORK/h_meta.txt" "Dataset metadata: $BASE/api/views/$DATASET.json"
               updated=$(grep -oE '"rowsUpdatedAt"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$meta" | grep -oE '[0-9]+$' || true)
               view_name=$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$meta" | head -1 \
                 | sed -E 's/^"name"[[:space:]]*:[[:space:]]*"(.*)"$/\1/' || true)
               if [[ "$updated" =~ ^[0-9]+$ ]]; then
                 last=$(aws ssm get-parameter --name "$PARAM_PREFIX/last-updated" --query Parameter.Value --output text 2>/dev/null || echo none)
                 if [[ "$last" == "$updated" && "${FORCE:-0}" != "1" ]]; then
-                  log "RDW data unchanged since the last import. Nothing to do."; exit 0
+                  log "RDW data unchanged since the last import. Nothing to do."; heartbeat; exit 0
                 fi
               else
                 updated=""
@@ -209,8 +299,9 @@ Resources:
               fi
 
               # 2. How many rows should a complete download have?
-              expected=$(curl -fsS --retry 3 "$BASE/resource/$DATASET.json?\$select=count(*)" \
+              expected=$(curl -fsS --retry 3 -D "$WORK/h_count.txt" "$BASE/resource/$DATASET.json?\$select=count(*)" \
                 | grep -oE '"[0-9]+"' | tr -d '"' || true)
+              check_deprecation "$WORK/h_count.txt" "Row count: $BASE/resource/$DATASET.json"
               if [[ ! "$expected" =~ ^[0-9]+$ ]]; then
                 log "Couldn't get the row count from RDW."; exit 1
               fi
@@ -222,19 +313,20 @@ Resources:
               #    --max-time is a safety cap (4h) so a connection that hangs without closing can't run forever.
               #    This is the SODA3 full export: public datasets need no app token for it. (The older
               #    /api/views/<id>/rows.csv export is deprecated and Socrata removes it in December 2026.)
-              mkdir -p "$WORK"
               gz="$WORK/$DATASET.csv.gz"
               ok=0
               for attempt in 1 2 3; do
                 log "Download attempt $attempt..."
-                if curl -fsSL --keepalive-time 60 --max-time 14400 \
+                if curl -fsSL --keepalive-time 60 --max-time 14400 -D "$WORK/h_export.txt" \
                      "$BASE/api/v3/views/$DATASET/export.csv" | gzip > "$gz"; then
+                  check_deprecation "$WORK/h_export.txt" "CSV export: $BASE/api/v3/views/$DATASET/export.csv"
                   lines=$(gzip -dc "$gz" | wc -l) || lines=0
                   rows=$(( lines - 1 ))
                   log "Got $rows rows ($(du -h "$gz" | cut -f1) compressed)."
                   if (( rows >= min_rows )); then ok=1; break; fi
                   log "That's fewer rows than RDW reports, so the download was cut short."
                 else
+                  check_deprecation "$WORK/h_export.txt" "CSV export: $BASE/api/v3/views/$DATASET/export.csv"
                   log "Download failed."
                 fi
                 if (( attempt < 3 )); then sleep 120; fi
@@ -318,6 +410,7 @@ Resources:
                 log "Deleting old table $t"
                 aws dynamodb delete-table --table-name "$t" >/dev/null
               done
+              heartbeat
               log "Done."
 
   SchedulerRole:
@@ -365,7 +458,77 @@ Resources:
               SecurityGroups: [!Ref TaskSecurityGroup]
               AssignPublicIp: ENABLED
 
+  FailedRunRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Email when a pipeline run ends with an error
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+          lastStatus: [STOPPED]
+          containers:
+            exitCode: [{ anything-but: 0 }]
+      Targets:
+        - Id: email
+          Arn: !Ref AlertTopic
+          InputTransformer:
+            InputPathsMap:
+              exit: $.detail.containers[0].exitCode
+              reason: $.detail.stoppedReason
+              task: $.detail.taskArn
+            InputTemplate: !Sub >-
+              "The RDW pipeline run failed (exit code <exit>: <reason>). Nothing was changed, so
+              apps keep using the previous table. The run's output is in CloudWatch Logs, log
+              group ${LogGroup}. Task: <task>"
+
+  FailedToStartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Email when a pipeline run couldn't start
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+          lastStatus: [STOPPED]
+          stopCode: [TaskFailedToStart]
+      Targets:
+        - Id: email
+          Arn: !Ref AlertTopic
+          InputTransformer:
+            InputPathsMap:
+              reason: $.detail.stoppedReason
+              task: $.detail.taskArn
+            InputTemplate: >-
+              "The RDW pipeline run couldn't start: <reason>. Nothing was changed, so apps keep
+              using the previous table. Task: <task>"
+
+  NoHealthyRunAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub >-
+        No healthy RDW pipeline run in 2 days, so the data in DynamoDB may be going stale. The
+        task may not be starting at all: check the schedule and the log group ${LogGroup}.
+      Namespace: RDWPipeline
+      MetricName: HealthyRun
+      Dimensions:
+        - Name: Stack
+          Value: !Ref AWS::StackName
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
 Outputs:
+  AlertTopicArn:
+    Description: SNS topic the alerts go to (subscribe more addresses here if needed)
+    Value: !Ref AlertTopic
   BucketName:
     Value: !Ref DataBucket
   CurrentTableParameter:

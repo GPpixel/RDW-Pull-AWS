@@ -39,8 +39,10 @@ aws ec2 describe-subnets --filters Name=default-for-az,Values=true --query "Subn
 Deploy, with the subnets comma-separated:
 
 ```
-aws cloudformation deploy --template-file rdw-pipeline.yaml --stack-name rdw-pipeline --capabilities CAPABILITY_IAM --parameter-overrides VpcId=vpc-xxxx SubnetIds=subnet-aaaa,subnet-bbbb
+aws cloudformation deploy --template-file rdw-pipeline.yaml --stack-name rdw-pipeline --capabilities CAPABILITY_IAM --parameter-overrides VpcId=vpc-xxxx SubnetIds=subnet-aaaa,subnet-bbbb AlertEmail=you@example.com
 ```
+
+AWS then emails `AlertEmail` a subscription confirmation. Click the link in it, or no alerts will arrive.
 
 The task gets a public IP to reach RDW, so it needs public subnets. The default VPC's subnets are public, and no NAT gateway is needed.
 
@@ -55,6 +57,18 @@ The task gets a public IP to reach RDW, so it needs public subnets. The default 
 | `TablePrefix` | `rdw-vehicles` | Prefix for the table names |
 | `KeepTables` | `2` | How many of the newest tables to keep |
 | `ParamPrefix` | `/rdw` | SSM path for `current-table`, `current-source-file` and `last-updated` |
+| `AlertEmail` | (none) | Where alert emails go. Without it, alerts are sent to the SNS topic but nobody receives them |
+
+## Alerts
+
+Alerts go to the email address you deployed with:
+
+- **A run failed.** Sent as soon as a run ends with an error, with the exit code and reason. That includes a download that was cut short three times, a failed import and too few items imported. The live table is left as it was.
+- **A run couldn't start.** For example, the container image couldn't be pulled or the network setup is wrong.
+- **No healthy run for 2 days.** This catches the case where runs aren't happening at all, such as the schedule failing to start tasks. A run counts as healthy if it imports new data or finds RDW's data unchanged. Shortly after deploying you may get one of these before the first run has happened. Start a run (below) and it should clear with an OK email.
+- **RDW announced a deprecation.** If any RDW response carries a `Deprecation` or `Sunset` header, the email lists which request it was and the notice, including the sunset date and RDW's info link. You get it once, and again only if the notice changes. It's also written to the run's log every time.
+
+To send alerts to more addresses, subscribe them to the SNS topic in the stack's `AlertTopicArn` output.
 
 ## Run it now
 
@@ -84,6 +98,8 @@ aws ssm get-parameter --name /rdw/current-source-file --query Parameter.Value --
 
 ## Notes
 
+- **Imports cost money each run.** DynamoDB charges for imports by the uncompressed size of the source data, about $0.15 per GB in us-east-1. At around 12 GB, that's roughly $1.80 per import, plus storage for the 2 tables kept. Days when RDW's data hasn't changed are skipped. If you don't need daily data, a weekly `ScheduleExpression` cuts the cost.
+- **One row per plate is assumed.** The completeness check compares the items imported with the rows downloaded. If some plates appear more than once, DynamoDB merges them, and if that's more than 0.1% of rows every run is rejected with "Too few items imported".
 - **Columns come in as text.** Every column other than the key is imported as a string, so convert dates and numbers in your app if you need them typed.
 - **Removing the stack doesn't remove the data.** The tables are created by the task, not by the stack, so delete the `rdw-vehicles-*` tables yourself. Empty the S3 bucket first, or the stack deletion fails.
-- **Not yet run against a live account.** The template's structure and references have been checked, and the embedded script was dry-run against fake RDW and AWS commands (first run, no change, new data, table clean-up, cut-off download, failed import, too few items, wrong key column, and RDW's metadata being unavailable). The first real deploy and run are still the real test. A full download from the SODA3 export route still needs comparing with the portal's Export button file before deploying.
+- **Not yet run against a live account.** The template's structure and references have been checked, and the embedded script was dry-run against fake RDW and AWS commands (first run, no change, new data, table clean-up, cut-off download, failed import, too few items, wrong key column, RDW's metadata being unavailable, healthy-run heartbeats, and deprecation emails being sent once, repeated only when the notice changes, and sent even when the run fails). The first real deploy and run are still the real test. A full download from the SODA3 export route still needs comparing with the portal's Export button file before deploying.
