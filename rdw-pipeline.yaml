@@ -37,7 +37,7 @@ Parameters:
     Type: String
     Default: /rdw
     AllowedPattern: '/[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]'
-    Description: SSM parameter path. <prefix>/current-table holds the live table name.
+    Description: SSM parameter path. <prefix>/current-table holds the live table name, <prefix>/current-source-file the RDW file it came from.
 
 Resources:
   DataBucket:
@@ -213,12 +213,15 @@ Resources:
 
               # 3. Download, gzipping on the fly (the uncompressed CSV never touches disk).
               #    A download that ends early - with or without an error - fails the row check and is retried.
+              #    --max-time is a safety cap (4h) so a connection that hangs without closing can't run forever.
               mkdir -p "$WORK"
               gz="$WORK/$DATASET.csv.gz"
+              hdr="$WORK/headers.txt"
               ok=0
               for attempt in 1 2 3; do
                 log "Download attempt $attempt..."
-                if curl -fsSL --keepalive-time 60 "$BASE/api/views/$DATASET/rows.csv?accessType=DOWNLOAD" | gzip > "$gz"; then
+                if curl -fsSL --keepalive-time 60 --max-time 14400 -D "$hdr" \
+                     "$BASE/api/views/$DATASET/rows.csv?accessType=DOWNLOAD" | gzip > "$gz"; then
                   lines=$(gzip -dc "$gz" | wc -l) || lines=0
                   rows=$(( lines - 1 ))
                   log "Got $rows rows ($(du -h "$gz" | cut -f1) compressed)."
@@ -230,6 +233,14 @@ Resources:
                 if (( attempt < 3 )); then sleep 120; fi
               done
               if (( ! ok )); then log "Giving up: no complete download after 3 attempts."; exit 1; fi
+
+              # Keep the file name RDW gives the download (from its Content-Disposition header),
+              # made safe for S3; fall back to <dataset>_<date>.csv if RDW didn't send one.
+              src_name=$(grep -i '^content-disposition:' "$hdr" 2>/dev/null | tail -1 | tr -d '\r' \
+                | sed -nE "s/.*filename\*?=(UTF-8'')?\"?([^\";]+)\"?.*/\2/Ip" || true)
+              src_name=$(printf '%s' "${src_name##*/}" | tr -c 'A-Za-z0-9._-' '_')
+              if [[ -z "$src_name" || "$src_name" == .* ]]; then src_name="${DATASET}_$(date -u +%Y%m%d).csv"; fi
+              log "RDW file name: $src_name"
 
               # 4. The table key must match a CSV column exactly (case-sensitive)
               header=$(gzip -dc "$gz" 2>/dev/null | head -1 | tr -d '\r"' | sed 's/^\xEF\xBB\xBF//' || true)
@@ -246,8 +257,9 @@ Resources:
               stamp=$(date -u +%Y%m%d-%H%M%S)
               table="${TABLE_PREFIX}-${stamp}"
               prefix="imports/${DATASET}/${stamp}/"
-              log "Uploading to s3://$BUCKET/$prefix"
-              aws s3 cp "$gz" "s3://$BUCKET/${prefix}${DATASET}.csv.gz" --only-show-errors
+              log "Uploading to s3://$BUCKET/${prefix}${src_name}.gz"
+              aws s3 cp "$gz" "s3://$BUCKET/${prefix}${src_name}.gz" --only-show-errors \
+                --metadata "rdw-rows-updated-at=$updated,rdw-row-count=$rows"
 
               # 6. Import into a brand-new table
               log "Starting import into $table..."
@@ -285,8 +297,9 @@ Resources:
 
               # 7. Point apps at the new table
               aws ssm put-parameter --name "$PARAM_PREFIX/current-table" --value "$table" --type String --overwrite >/dev/null
+              aws ssm put-parameter --name "$PARAM_PREFIX/current-source-file" --value "$src_name" --type String --overwrite >/dev/null
               aws ssm put-parameter --name "$PARAM_PREFIX/last-updated" --value "$updated" --type String --overwrite >/dev/null
-              log "Switched $PARAM_PREFIX/current-table to $table."
+              log "Switched $PARAM_PREFIX/current-table to $table (from $src_name)."
 
               # 8. Delete older tables, keeping the newest $KEEP_TABLES (the new one plus a previous one to fall back to)
               old=$(aws dynamodb list-tables --query "TableNames[?starts_with(@, '${TABLE_PREFIX}-')]" --output text \
@@ -349,6 +362,9 @@ Outputs:
   CurrentTableParameter:
     Description: SSM parameter holding the live table name - read this from your app
     Value: !Sub ${ParamPrefix}/current-table
+  CurrentSourceFileParameter:
+    Description: SSM parameter holding the RDW file name the live table was built from
+    Value: !Sub ${ParamPrefix}/current-source-file
   LogGroupName:
     Description: CloudWatch log group with each run's output
     Value: !Ref LogGroup
