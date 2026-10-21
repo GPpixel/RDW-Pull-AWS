@@ -311,8 +311,7 @@ Resources:
               # 3. Download, gzipping on the fly (the uncompressed CSV never touches disk).
               #    A download that ends early - with or without an error - fails the row check and is retried.
               #    --max-time is a safety cap (4h) so a connection that hangs without closing can't run forever.
-              #    This is the SODA3 full export: public datasets need no app token for it. (The older
-              #    /api/views/<id>/rows.csv export is deprecated and Socrata removes it in December 2026.)
+              #    This is the SODA3 full export: public datasets need no app token for it.
               gz="$WORK/$DATASET.csv.gz"
               ok=0
               for attempt in 1 2 3; do
