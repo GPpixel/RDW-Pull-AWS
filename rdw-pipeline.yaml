@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Daily RDW open data download into DynamoDB. A scheduled Fargate task downloads the CSV,
+  checks it's complete, uploads it to S3, imports it into a new DynamoDB table, then points
+  the SSM parameter <ParamPrefix>/current-table at that table and deletes older tables.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the task (the default VPC is fine).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets in that VPC. The task gets a public IP to reach RDW, so no NAT gateway is needed.
+  ScheduleExpression:
+    Type: String
+    Default: cron(30 4 * * ? *)
+    Description: When to run (EventBridge Scheduler syntax), in Europe/London time.
+  DatasetId:
+    Type: String
+    Default: m9d7-ebf2
+    Description: RDW dataset ID (m9d7-ebf2 = Gekentekende_voertuigen).
+  KeyAttribute:
+    Type: String
+    Default: Kenteken
+    Description: CSV column to use as the table key. Must match the CSV header exactly (case-sensitive).
+  TablePrefix:
+    Type: String
+    Default: rdw-vehicles
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+    Description: Each import creates a table named <prefix>-<UTC timestamp>.
+  KeepTables:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: How many of the newest tables to keep (2 = the live one plus one to fall back to).
+  ParamPrefix:
+    Type: String
+    Default: /rdw
+    AllowedPattern: '/[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]'
+    Description: SSM parameter path. <prefix>/current-table holds the live table name.
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldDownloads
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 30
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDW pipeline task - outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rdw-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Bucket
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub ${DataBucket.Arn}/*
+              - Sid: BucketList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: Tables
+                Effect: Allow
+                Action:
+                  - dynamodb:ImportTable
+                  - dynamodb:DescribeImport
+                  - dynamodb:CreateTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:DeleteTable
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TablePrefix}-*
+              - Sid: ListTables
+                Effect: Allow
+                Action: dynamodb:ListTables
+                Resource: '*'
+              - Sid: Params
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParamPrefix}/*
+              - Sid: ImportErrorLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:PutRetentionPolicy
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-dynamodb/*
+              - Sid: ImportErrorLogsDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-pipeline
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      EphemeralStorage:
+        SizeInGiB: 30
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: pipeline
+          Image: public.ecr.aws/aws-cli/aws-cli:latest
+          Essential: true
+          EntryPoint: [/bin/bash, -c]
+          Environment:
+            - { Name: BUCKET, Value: !Ref DataBucket }
+            - { Name: DATASET, Value: !Ref DatasetId }
+            - { Name: KEY_ATTR, Value: !Ref KeyAttribute }
+            - { Name: TABLE_PREFIX, Value: !Ref TablePrefix }
+            - { Name: KEEP_TABLES, Value: !Ref KeepTables }
+            - { Name: PARAM_PREFIX, Value: !Ref ParamPrefix }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: run
+          Command:
+            - |
+              set -euo pipefail
+              log() { echo "$(date -u '+%Y-%m-%d %H:%M:%S') $*"; }
+
+              : "${BUCKET:?}" "${DATASET:?}" "${TABLE_PREFIX:?}" "${KEY_ATTR:?}" "${PARAM_PREFIX:?}"
+              KEEP_TABLES="${KEEP_TABLES:-2}"
+              BASE="${RDW_BASE:-https://opendata.rdw.nl}"
+              WORK="${WORK:-/tmp/rdw}"
+
+              # The AWS CLI image is minimal: install curl/gzip if it lacks them
+              missing=""
+              for t in curl gzip; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+              if [[ -n "$missing" ]]; then
+                log "Installing:$missing"
+                (dnf -y -q install curl-minimal gzip || yum -y -q install curl gzip) >/dev/null
+              fi
+
+              # 1. Has RDW published new data since the last import?
+              updated=$(curl -fsS --retry 3 "$BASE/api/views/$DATASET.json" \
+                | grep -oE '"rowsUpdatedAt"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+              if [[ ! "$updated" =~ ^[0-9]+$ ]]; then
+                log "Couldn't read the dataset's update time from RDW."; exit 1
+              fi
+              last=$(aws ssm get-parameter --name "$PARAM_PREFIX/last-updated" --query Parameter.Value --output text 2>/dev/null || echo none)
+              if [[ "$last" == "$updated" && "${FORCE:-0}" != "1" ]]; then
+                log "RDW data unchanged since the last import. Nothing to do."; exit 0
+              fi
+
+              # 2. How many rows should a complete download have?
+              expected=$(curl -fsS --retry 3 "$BASE/resource/$DATASET.json?\$select=count(*)" \
+                | grep -oE '"[0-9]+"' | tr -d '"' || true)
+              if [[ ! "$expected" =~ ^[0-9]+$ ]]; then
+                log "Couldn't get the row count from RDW."; exit 1
+              fi
+              min_rows=$(( expected * 999 / 1000 ))
+              log "RDW reports $expected rows."
+
+              # 3. Download, gzipping on the fly (the uncompressed CSV never touches disk).
+              #    A download that ends early - with or without an error - fails the row check and is retried.
+              mkdir -p "$WORK"
+              gz="$WORK/$DATASET.csv.gz"
+              ok=0
+              for attempt in 1 2 3; do
+                log "Download attempt $attempt..."
+                if curl -fsSL --keepalive-time 60 "$BASE/api/views/$DATASET/rows.csv?accessType=DOWNLOAD" | gzip > "$gz"; then
+                  lines=$(gzip -dc "$gz" | wc -l) || lines=0
+                  rows=$(( lines - 1 ))
+                  log "Got $rows rows ($(du -h "$gz" | cut -f1) compressed)."
+                  if (( rows >= min_rows )); then ok=1; break; fi
+                  log "That's fewer rows than RDW reports, so the download was cut short."
+                else
+                  log "Download failed."
+                fi
+                if (( attempt < 3 )); then sleep 120; fi
+              done
+              if (( ! ok )); then log "Giving up: no complete download after 3 attempts."; exit 1; fi
+
+              # 4. The table key must match a CSV column exactly (case-sensitive)
+              header=$(gzip -dc "$gz" 2>/dev/null | head -1 | tr -d '\r"' | sed 's/^\xEF\xBB\xBF//' || true)
+              found=0
+              IFS=, read -ra cols <<<"$header"
+              for c in "${cols[@]}"; do
+                if [[ "$c" == "$KEY_ATTR" ]]; then found=1; fi
+              done
+              if (( ! found )); then
+                log "Column '$KEY_ATTR' isn't in the CSV header. Header is: $header"; exit 1
+              fi
+
+              # 5. Upload to S3
+              stamp=$(date -u +%Y%m%d-%H%M%S)
+              table="${TABLE_PREFIX}-${stamp}"
+              prefix="imports/${DATASET}/${stamp}/"
+              log "Uploading to s3://$BUCKET/$prefix"
+              aws s3 cp "$gz" "s3://$BUCKET/${prefix}${DATASET}.csv.gz" --only-show-errors
+
+              # 6. Import into a brand-new table
+              log "Starting import into $table..."
+              arn=$(aws dynamodb import-table \
+                --s3-bucket-source "S3Bucket=$BUCKET,S3KeyPrefix=$prefix" \
+                --input-format CSV --input-compression-type GZIP \
+                --table-creation-parameters "{\"TableName\":\"$table\",\"KeySchema\":[{\"AttributeName\":\"$KEY_ATTR\",\"KeyType\":\"HASH\"}],\"AttributeDefinitions\":[{\"AttributeName\":\"$KEY_ATTR\",\"AttributeType\":\"S\"}],\"BillingMode\":\"PAY_PER_REQUEST\"}" \
+                --query ImportTableDescription.ImportArn --output text)
+
+              while :; do
+                sleep "${POLL_SECONDS:-60}"
+                status=$(aws dynamodb describe-import --import-arn "$arn" --query ImportTableDescription.ImportStatus --output text)
+                case "$status" in
+                  COMPLETED) break ;;
+                  FAILED|CANCELLED)
+                    reason=$(aws dynamodb describe-import --import-arn "$arn" --output text \
+                      --query '[ImportTableDescription.FailureCode, ImportTableDescription.FailureMessage]' || true)
+                    log "Import $status: $reason"
+                    aws dynamodb delete-table --table-name "$table" >/dev/null 2>&1 || true
+                    exit 1 ;;
+                  *) log "Import status: $status" ;;
+                esac
+              done
+
+              counts=$(aws dynamodb describe-import --import-arn "$arn" --output text \
+                --query '[ImportTableDescription.ImportedItemCount, ImportTableDescription.ErrorCount]')
+              read -r imported errors <<<"$counts"
+              imported=${imported//[^0-9]/}; imported=${imported:-0}
+              log "Imported $imported items (errors: $errors)."
+              if (( imported < min_rows )); then
+                log "Too few items imported. Keeping the current table and deleting $table."
+                aws dynamodb delete-table --table-name "$table" >/dev/null 2>&1 || true
+                exit 1
+              fi
+
+              # 7. Point apps at the new table
+              aws ssm put-parameter --name "$PARAM_PREFIX/current-table" --value "$table" --type String --overwrite >/dev/null
+              aws ssm put-parameter --name "$PARAM_PREFIX/last-updated" --value "$updated" --type String --overwrite >/dev/null
+              log "Switched $PARAM_PREFIX/current-table to $table."
+
+              # 8. Delete older tables, keeping the newest $KEEP_TABLES (the new one plus a previous one to fall back to)
+              old=$(aws dynamodb list-tables --query "TableNames[?starts_with(@, '${TABLE_PREFIX}-')]" --output text \
+                | tr '\t' '\n' | sort | head -n -"$KEEP_TABLES" || true)
+              for t in $old; do
+                if [[ "$t" == "$table" ]]; then continue; fi
+                log "Deleting old table $t"
+                aws dynamodb delete-table --table-name "$t" >/dev/null
+              done
+              log "Done."
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-pipeline-task
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref TaskDefinition
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Daily RDW download and DynamoDB import
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: Europe/London
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 30
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          LaunchType: FARGATE
+          PlatformVersion: LATEST
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              Subnets: !Ref SubnetIds
+              SecurityGroups: [!Ref TaskSecurityGroup]
+              AssignPublicIp: ENABLED
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  CurrentTableParameter:
+    Description: SSM parameter holding the live table name - read this from your app
+    Value: !Sub ${ParamPrefix}/current-table
+  LogGroupName:
+    Description: CloudWatch log group with each run's output
+    Value: !Ref LogGroup
+  RunNowCommand:
+    Description: Start a run now instead of waiting for the schedule
+    Value: !Sub
+      - >-
+        aws ecs run-task --cluster ${Cluster} --task-definition ${TaskDefinition} --launch-type FARGATE
+        --network-configuration "awsvpcConfiguration={subnets=[${Subnets}],securityGroups=[${TaskSecurityGroup}],assignPublicIp=ENABLED}"
+      - Subnets: !Join [',', !Ref SubnetIds]
