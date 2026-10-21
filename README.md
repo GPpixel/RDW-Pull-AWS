@@ -15,15 +15,15 @@ Each run:
 2. Gets RDW's own row count, then downloads the full CSV export from `/api/v3/views/<dataset>/export.csv`, gzipping it as it arrives. The uncompressed file never touches disk.
    - **No app token needed.** This is Socrata's SODA3 full export, which public datasets serve without one.
    - **Not the old export URL.** The older `/api/views/<dataset>/rows.csv` export is deprecated, and Socrata removes it in December 2026.
-   - **Uncompressed transfer.** The transfer itself isn't compressed, because a compressed transfer was seen to stop early.
+   - **Uncompressed transfer.** The transfer itself isn't compressed.
    - **4-hour cap.** It stops a connection that hangs without closing.
 3. Rejects any download with fewer than 99.9% of the expected rows. That includes downloads that end early without an error. It retries up to 3 times.
-4. Uploads the file to S3, named like RDW's own downloads with RDW's update date added for versioning (for example `Open_Data_RDW__Gekentekende_voertuigen_2026-10-20.csv.gz`). S3 keeps it for 7 days, with RDW's update time and the row count attached as object metadata.
+4. Uploads the file to S3, named exactly as the portal's Export button names it, with `.gz` added (for example `Open_Data_RDW__Gekentekende_voertuigen_20261021.csv.gz`, dated with the download day). S3 keeps it for 7 days, with RDW's own update time and the row count attached as object metadata.
 5. Imports it into a brand-new table, `rdw-vehicles-<UTC timestamp>`, with on-demand billing and `Kenteken` as the key.
 6. Checks the number of items imported. If it looks right, it points the SSM parameter `/rdw/current-table` at the new table, and records the RDW file name it came from in `/rdw/current-source-file`.
 7. Deletes all but the 2 newest tables, keeping the previous one to fall back to.
 
-If RDW's dataset metadata (update time and name) can't be read, the run carries on anyway: it can't skip unchanged days, and it names the file `<dataset>_<run date>.csv`. A failed or incomplete run leaves the live table untouched. Apps should read the table name from `/rdw/current-table` rather than hard-coding it, so they switch to new data with no downtime.
+If RDW's dataset metadata (update time and name) can't be read, the run carries on anyway: it can't skip unchanged days, and it names the file `<dataset>_<YYYYMMDD>.csv`. A failed or incomplete run leaves the live table untouched. Apps should read the table name from `/rdw/current-table` rather than hard-coding it, so they switch to new data with no downtime.
 
 ## Deploy
 

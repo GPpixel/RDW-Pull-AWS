@@ -333,12 +333,12 @@ Resources:
               done
               if (( ! ok )); then log "Giving up: no complete download after 3 attempts."; exit 1; fi
 
-              # Name the file the way RDW names its downloads (the dataset name made file-safe, e.g.
-              # Open_Data_RDW__Gekentekende_voertuigen) plus RDW's update date, for versioning.
+              # Name the file exactly as the portal's Export button does: the dataset name made file-safe
+              # plus the download date, e.g. Open_Data_RDW__Gekentekende_voertuigen_20261021.csv.
+              # (RDW's own update time is kept in the S3 object metadata and <ParamPrefix>/last-updated.)
               base=$(printf '%s' "$view_name" | tr -c 'A-Za-z0-9._-' '_')
               if [[ -z "$base" || "$base" == .* ]]; then base="$DATASET"; fi
-              if [[ -n "$updated" ]]; then version=$(date -u -d "@$updated" +%Y-%m-%d); else version=$(date -u +%Y-%m-%d); fi
-              src_name="${base}_${version}.csv"
+              src_name="${base}_$(date -u +%Y%m%d).csv"
               log "File name: $src_name"
 
               # 4. The table key must match a CSV column exactly (case-sensitive)
