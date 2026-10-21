@@ -192,14 +192,20 @@ Resources:
               fi
 
               # 1. Has RDW published new data since the last import?
-              updated=$(curl -fsS --retry 3 "$BASE/api/views/$DATASET.json" \
-                | grep -oE '"rowsUpdatedAt"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
-              if [[ ! "$updated" =~ ^[0-9]+$ ]]; then
-                log "Couldn't read the dataset's update time from RDW."; exit 1
-              fi
-              last=$(aws ssm get-parameter --name "$PARAM_PREFIX/last-updated" --query Parameter.Value --output text 2>/dev/null || echo none)
-              if [[ "$last" == "$updated" && "${FORCE:-0}" != "1" ]]; then
-                log "RDW data unchanged since the last import. Nothing to do."; exit 0
+              #    The dataset's metadata gives its update time and name. If RDW ever stops serving it,
+              #    the pipeline carries on regardless; it just can't skip days when nothing changed.
+              meta=$(curl -fsS --retry 3 "$BASE/api/views/$DATASET.json" || true)
+              updated=$(grep -oE '"rowsUpdatedAt"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$meta" | grep -oE '[0-9]+$' || true)
+              view_name=$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$meta" | head -1 \
+                | sed -E 's/^"name"[[:space:]]*:[[:space:]]*"(.*)"$/\1/' || true)
+              if [[ "$updated" =~ ^[0-9]+$ ]]; then
+                last=$(aws ssm get-parameter --name "$PARAM_PREFIX/last-updated" --query Parameter.Value --output text 2>/dev/null || echo none)
+                if [[ "$last" == "$updated" && "${FORCE:-0}" != "1" ]]; then
+                  log "RDW data unchanged since the last import. Nothing to do."; exit 0
+                fi
+              else
+                updated=""
+                log "Couldn't read RDW's update time, so downloading anyway."
               fi
 
               # 2. How many rows should a complete download have?
@@ -214,14 +220,15 @@ Resources:
               # 3. Download, gzipping on the fly (the uncompressed CSV never touches disk).
               #    A download that ends early - with or without an error - fails the row check and is retried.
               #    --max-time is a safety cap (4h) so a connection that hangs without closing can't run forever.
+              #    This is the SODA3 full export: public datasets need no app token for it. (The older
+              #    /api/views/<id>/rows.csv export is deprecated and Socrata removes it in December 2026.)
               mkdir -p "$WORK"
               gz="$WORK/$DATASET.csv.gz"
-              hdr="$WORK/headers.txt"
               ok=0
               for attempt in 1 2 3; do
                 log "Download attempt $attempt..."
-                if curl -fsSL --keepalive-time 60 --max-time 14400 -D "$hdr" \
-                     "$BASE/api/views/$DATASET/rows.csv?accessType=DOWNLOAD" | gzip > "$gz"; then
+                if curl -fsSL --keepalive-time 60 --max-time 14400 \
+                     "$BASE/api/v3/views/$DATASET/export.csv" | gzip > "$gz"; then
                   lines=$(gzip -dc "$gz" | wc -l) || lines=0
                   rows=$(( lines - 1 ))
                   log "Got $rows rows ($(du -h "$gz" | cut -f1) compressed)."
@@ -234,13 +241,13 @@ Resources:
               done
               if (( ! ok )); then log "Giving up: no complete download after 3 attempts."; exit 1; fi
 
-              # Keep the file name RDW gives the download (from its Content-Disposition header),
-              # made safe for S3; fall back to <dataset>_<date>.csv if RDW didn't send one.
-              src_name=$(grep -i '^content-disposition:' "$hdr" 2>/dev/null | tail -1 | tr -d '\r' \
-                | sed -nE "s/.*filename\*?=(UTF-8'')?\"?([^\";]+)\"?.*/\2/Ip" || true)
-              src_name=$(printf '%s' "${src_name##*/}" | tr -c 'A-Za-z0-9._-' '_')
-              if [[ -z "$src_name" || "$src_name" == .* ]]; then src_name="${DATASET}_$(date -u +%Y%m%d).csv"; fi
-              log "RDW file name: $src_name"
+              # Name the file the way RDW names its downloads (the dataset name made file-safe, e.g.
+              # Open_Data_RDW__Gekentekende_voertuigen) plus RDW's update date, for versioning.
+              base=$(printf '%s' "$view_name" | tr -c 'A-Za-z0-9._-' '_')
+              if [[ -z "$base" || "$base" == .* ]]; then base="$DATASET"; fi
+              if [[ -n "$updated" ]]; then version=$(date -u -d "@$updated" +%Y-%m-%d); else version=$(date -u +%Y-%m-%d); fi
+              src_name="${base}_${version}.csv"
+              log "File name: $src_name"
 
               # 4. The table key must match a CSV column exactly (case-sensitive)
               header=$(gzip -dc "$gz" 2>/dev/null | head -1 | tr -d '\r"' | sed 's/^\xEF\xBB\xBF//' || true)
@@ -259,7 +266,7 @@ Resources:
               prefix="imports/${DATASET}/${stamp}/"
               log "Uploading to s3://$BUCKET/${prefix}${src_name}.gz"
               aws s3 cp "$gz" "s3://$BUCKET/${prefix}${src_name}.gz" --only-show-errors \
-                --metadata "rdw-rows-updated-at=$updated,rdw-row-count=$rows"
+                --metadata "rdw-rows-updated-at=${updated:-unknown},rdw-row-count=$rows"
 
               # 6. Import into a brand-new table
               log "Starting import into $table..."
@@ -298,7 +305,9 @@ Resources:
               # 7. Point apps at the new table
               aws ssm put-parameter --name "$PARAM_PREFIX/current-table" --value "$table" --type String --overwrite >/dev/null
               aws ssm put-parameter --name "$PARAM_PREFIX/current-source-file" --value "$src_name" --type String --overwrite >/dev/null
-              aws ssm put-parameter --name "$PARAM_PREFIX/last-updated" --value "$updated" --type String --overwrite >/dev/null
+              if [[ -n "$updated" ]]; then
+                aws ssm put-parameter --name "$PARAM_PREFIX/last-updated" --value "$updated" --type String --overwrite >/dev/null
+              fi
               log "Switched $PARAM_PREFIX/current-table to $table (from $src_name)."
 
               # 8. Delete older tables, keeping the newest $KEEP_TABLES (the new one plus a previous one to fall back to)
